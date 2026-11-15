@@ -1814,16 +1814,25 @@ def create_table(
 @click.argument("table")
 @click.argument("new_table")
 @click.option("--ignore", is_flag=True, help="If table does not exist, do nothing")
+@click.option(
+    "--structure",
+    is_flag=True,
+    help="Also copy constraints, indexes, triggers and full-text search configuration",
+)
 @load_extension_option
-def duplicate(path, table, new_table, ignore, load_extension):
+def duplicate(path, table, new_table, ignore, structure, load_extension):
     """
     Create a duplicate of this table, copying across the schema and all row data.
+
+    By default this is a lightweight copy: column names, column types and row
+    data are preserved, but constraints, indexes, triggers and full-text
+    search configuration are not. Use --structure to copy those as well.
     """
     db = sqlite_utils.Database(path)
     _register_db_for_cleanup(db)
     _load_extensions(db, load_extension)
     try:
-        db.table(table).duplicate(new_table)
+        db.table(table).duplicate(new_table, structure=structure)
     except NoTable:
         if not ignore:
             raise click.ClickException(f'Table "{table}" does not exist')

@@ -1060,6 +1060,16 @@ The ``table.duplicate()`` method creates a copy of the table, copying both the t
 
 The new ``authors_copy`` table will now contain a duplicate copy of the data from ``authors``.
 
+By default this is a lightweight copy implemented with ``CREATE TABLE ... AS SELECT``: column names, column types and row data are preserved, but primary keys, unique, not-null and check constraints, indexes, triggers and any full-text search configuration are not. Pass ``structure=True`` to copy those as well:
+
+.. code-block:: python
+
+    db.table("authors").duplicate("authors_copy", structure=True)
+
+With ``structure=True`` the copy is created from the original ``CREATE TABLE`` statement, so constraints, defaults, foreign keys and options such as ``STRICT`` are all preserved - self-referencing foreign keys are re-bound to the new table. Indexes and triggers are copied too, with table names embedded in their definitions re-bound to the new table name. If the original table has full-text search enabled, an equivalent FTS virtual table (same columns, tokenizer and FTS version) is created for the copy and populated, including synchronization triggers if the original had them.
+
+Index and trigger names live in a database-wide namespace in SQLite, so copied objects are renamed: the original table name in the object name is replaced by the new table name, or appended to it if absent, with a numeric suffix added if the result is still taken. For example an index called ``idx_authors_name`` becomes ``idx_authors_copy_name``.
+
 This method raises ``sqlite_utils.db.NoTable`` if the table does not exist.
 
 .. note::

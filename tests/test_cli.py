@@ -2847,6 +2847,25 @@ def test_duplicate_table(tmpdir):
     assert list(db.table("one").rows) == list(db.table("two").rows)
 
 
+def test_duplicate_table_structure(tmpdir):
+    db_path = str(tmpdir / "test.db")
+    db = Database(db_path)
+    db.table("one").insert({"id": 1, "name": "Cleo"}, pk="id")
+    db.table("one").enable_fts(["name"], create_triggers=True)
+    result = CliRunner().invoke(
+        cli.cli,
+        ["duplicate", db_path, "one", "two", "--structure"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    # Primary key, FTS table and synchronization triggers all came across
+    assert db.table("two").pks == ["id"]
+    assert db.table("two").detect_fts() == "two_fts"
+    assert [row["name"] for row in db.table("two").search("Cleo")] == ["Cleo"]
+    db.table("two").insert({"id": 2, "name": "Cleo II"})
+    assert len(list(db.table("two").search("Cleo"))) == 2
+
+
 @pytest.mark.skipif(not _has_compiled_ext(), reason="Requires compiled ext.c")
 @pytest.mark.parametrize(
     "entrypoint,should_pass,should_fail",

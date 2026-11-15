@@ -99,6 +99,88 @@ def quote_identifier(identifier: str) -> str:
     return '"{}"'.format(identifier.replace('"', '""'))
 
 
+# Matches a SQLite identifier in any of its quoted or bare forms
+_identifier_token = (
+    r'(?:"(?:[^"]|"")*"|\[[^\]]*\]|`[^`]*`|[A-Za-z_\u0080-￿][A-Za-z0-9_$\u0080-￿]*)'
+)
+
+_create_table_header_re = re.compile(
+    r"^(\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)({})".format(_identifier_token),
+    re.IGNORECASE,
+)
+
+_create_index_header_re = re.compile(
+    r"^(\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?)({})".format(
+        _identifier_token
+    ),
+    re.IGNORECASE,
+)
+
+_create_trigger_header_re = re.compile(
+    r"^(\s*CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?)({})".format(_identifier_token),
+    re.IGNORECASE,
+)
+
+_index_on_clause_re = re.compile(
+    r"(\bON\s+)({})(?=\s*\()".format(_identifier_token),
+    re.IGNORECASE,
+)
+
+_references_clause_re = re.compile(
+    r"(\bREFERENCES\s+)({})".format(_identifier_token),
+    re.IGNORECASE,
+)
+
+
+def _unquote_identifier(token: str) -> str:
+    "Reverse the quoting of a SQLite identifier token, if it is quoted."
+    if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+        return token[1:-1].replace('""', '"')
+    if len(token) >= 2 and token[0] == "`" and token[-1] == "`":
+        return token[1:-1]
+    if len(token) >= 2 and token[0] == "[" and token[-1] == "]":
+        return token[1:-1]
+    return token
+
+
+def _replace_identifier_references(sql: str, old_name: str, new_name: str) -> str:
+    """
+    Replace references to the identifier ``old_name`` in ``sql`` with
+    ``new_name``, handling double-quoted, backtick-quoted, square-bracketed
+    and bare identifier forms. Replacements are always emitted double-quoted.
+    """
+    quoted_new = quote_identifier(new_name)
+    sql = sql.replace('"{}"'.format(old_name.replace('"', '""')), quoted_new)
+    sql = sql.replace("`{}`".format(old_name), quoted_new)
+    sql = sql.replace("[{}]".format(old_name), quoted_new)
+    return re.sub(
+        r"(?<![A-Za-z0-9_$]){}(?![A-Za-z0-9_$])".format(re.escape(old_name)),
+        lambda _: quoted_new,
+        sql,
+    )
+
+
+def _copy_object_name(
+    source_table: str, new_table: str, object_name: str, taken: set[str]
+) -> str:
+    """
+    Derive a name for a copied index or trigger. The source table name is
+    replaced by the new table name if it occurs in the object name, otherwise
+    the new table name is appended. Numeric suffixes resolve any remaining
+    collisions against ``taken``.
+    """
+    if source_table in object_name:
+        base = object_name.replace(source_table, new_table)
+    else:
+        base = "{}_{}".format(object_name, new_table)
+    candidate = base
+    suffix = 2
+    while candidate in taken:
+        candidate = "{}_{}".format(base, suffix)
+        suffix += 1
+    return candidate
+
+
 def _check_constraint_sql(check: Check) -> str:
     prefix = f"CONSTRAINT {quote_identifier(check.name)} " if check.name else ""
     newline = "\n" if sql_ends_in_line_comment(check.check) else ""
@@ -2627,18 +2709,159 @@ class Table(Queryable):
             )
         return self
 
-    def duplicate(self, new_name: str) -> "Table":
+    def duplicate(self, new_name: str, *, structure: bool = False) -> "Table":
         """
         Create a duplicate of this table, copying across the schema and all row data.
 
+        By default this performs a lightweight copy using
+        ``CREATE TABLE ... AS SELECT`` - column names, column types and row
+        data are preserved, but primary keys, constraints, indexes, triggers
+        and any full-text search configuration are not.
+
+        Pass ``structure=True`` to also copy the full table structure:
+        primary key, unique, not-null and check constraints, foreign keys,
+        indexes, triggers and any FTS configuration. Table names embedded in
+        the copied index and trigger definitions are re-bound to the new
+        table name. Index and trigger names live in a database-wide
+        namespace, so copied objects are renamed by substituting the new
+        table name for the original table name (appending it if absent, then
+        a numeric suffix if the result is still taken).
+
         :param new_name: Name of the new table
+        :param structure: If True, copy constraints, indexes, triggers and
+          FTS configuration in addition to columns and rows
         """
         if not self.exists():
             raise NoTable(f"Table {self.name} does not exist")
         with self.db.atomic():
-            sql = f"CREATE TABLE {quote_identifier(new_name)} AS SELECT * FROM {quote_identifier(self.name)};"
-            self.db.execute(sql)
+            if not structure:
+                sql = f"CREATE TABLE {quote_identifier(new_name)} AS SELECT * FROM {quote_identifier(self.name)};"
+                self.db.execute(sql)
+            else:
+                self._duplicate_with_structure(new_name)
         return self.db.table(new_name)
+
+    def _duplicate_with_structure(self, new_name: str) -> None:
+        "Faithful copy used by ``duplicate(structure=True)`` - see that method."
+        # 1. The table itself: re-bind the original CREATE TABLE statement so
+        # primary keys, unique/not-null/check constraints, defaults, foreign
+        # keys and options such as STRICT are all preserved.
+        create_sql = _create_table_header_re.sub(
+            lambda m: m.group(1) + quote_identifier(new_name), self.schema, count=1
+        )
+        # Self-referencing foreign keys should follow the copy
+        create_sql = _references_clause_re.sub(
+            lambda m: m.group(1)
+            + (
+                quote_identifier(new_name)
+                if _unquote_identifier(m.group(2)) == self.name
+                else m.group(2)
+            ),
+            create_sql,
+        )
+        self.db.execute(create_sql)
+        self.db.execute(
+            "INSERT INTO {} SELECT * FROM {}".format(
+                quote_identifier(new_name), quote_identifier(self.name)
+            )
+        )
+        # 2. Explicit indexes (sql is None for auto-indexes backing
+        # constraints - those already came across with the table schema)
+        taken = {row[0] for row in self.db.execute("select name from sqlite_master")}
+        for index_name, index_sql in self.db.execute(
+            "select name, sql from sqlite_master"
+            " where type = 'index' and tbl_name = ? and sql is not null",
+            (self.name,),
+        ):
+            new_index_name = _copy_object_name(self.name, new_name, index_name, taken)
+            taken.add(new_index_name)
+            new_index_sql = _create_index_header_re.sub(
+                lambda m: m.group(1) + quote_identifier(new_index_name),
+                index_sql,
+                count=1,
+            )
+            new_index_sql = _index_on_clause_re.sub(
+                lambda m: m.group(1)
+                + (
+                    quote_identifier(new_name)
+                    if _unquote_identifier(m.group(2)) == self.name
+                    else m.group(2)
+                ),
+                new_index_sql,
+            )
+            self.db.execute(new_index_sql)
+        # 3. Triggers - except FTS synchronization triggers, which are
+        # recreated against the new FTS table in step 4
+        fts_config = self._detect_fts_config()
+        fts_trigger_names = (
+            {self.name + suffix for suffix in ("_ai", "_ad", "_au")}
+            if fts_config and fts_config["create_triggers"]
+            else set()
+        )
+        for trigger_name, trigger_sql in self.db.execute(
+            "select name, sql from sqlite_master"
+            " where type = 'trigger' and tbl_name = ?",
+            (self.name,),
+        ):
+            if trigger_name in fts_trigger_names:
+                continue
+            new_trigger_name = _copy_object_name(
+                self.name, new_name, trigger_name, taken
+            )
+            taken.add(new_trigger_name)
+            new_trigger_sql = _create_trigger_header_re.sub(
+                lambda m: m.group(1) + quote_identifier(new_trigger_name),
+                trigger_sql,
+                count=1,
+            )
+            # Re-bind table names embedded in the trigger definition - both
+            # the ON clause and any references in the trigger body
+            new_trigger_sql = _replace_identifier_references(
+                new_trigger_sql, self.name, new_name
+            )
+            self.db.execute(new_trigger_sql)
+        # 4. Full-text search: recreate the FTS virtual table and its
+        # synchronization triggers against the new table, then populate it
+        if fts_config:
+            self.db.table(new_name).enable_fts(
+                fts_config["columns"],
+                fts_version=fts_config["fts_version"],
+                create_triggers=fts_config["create_triggers"],
+                tokenize=fts_config["tokenize"],
+            )
+
+    def _detect_fts_config(self) -> dict | None:
+        """
+        Inspect any FTS virtual table associated with this table and return a
+        configuration dictionary with ``columns``, ``fts_version``,
+        ``create_triggers`` and ``tokenize`` keys, or None if this table does
+        not have full-text search enabled.
+        """
+        fts_table = self.detect_fts()
+        if fts_table is None:
+            return None
+        fts_schema = self.db[fts_table].schema or ""
+        columns = [column.name for column in self.db[fts_table].columns]
+        version_match = re.search(r"\bUSING\s+(fts\d)\b", fts_schema, re.IGNORECASE)
+        fts_version = version_match.group(1).upper() if version_match else "FTS5"
+        tokenize = None
+        tokenize_match = re.search(
+            r"""tokenize\s*=\s*(?:'([^']*)'|"([^"]*)"|([^\s,)]+))""",
+            fts_schema,
+            re.IGNORECASE,
+        )
+        if tokenize_match:
+            tokenize = next(g for g in tokenize_match.groups() if g is not None)
+        expected_triggers = {self.name + suffix for suffix in ("_ai", "_ad", "_au")}
+        create_triggers = expected_triggers.issubset(
+            {trigger.name for trigger in self.triggers}
+        )
+        return {
+            "columns": columns,
+            "fts_version": fts_version,
+            "create_triggers": create_triggers,
+            "tokenize": tokenize,
+        }
 
     def transform(
         self,

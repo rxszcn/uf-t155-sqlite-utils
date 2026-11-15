@@ -2201,6 +2201,12 @@ The ``duplicate`` command duplicates a table - creating a new table with the sam
 
     sqlite-utils duplicate books.db authors authors_copy
 
+By default this is a lightweight copy: column names, column types and row data are preserved, but constraints, indexes, triggers and full-text search configuration are not. Add ``--structure`` to copy those as well:
+
+.. code-block:: bash
+
+    sqlite-utils duplicate books.db authors authors_copy --structure
+
 .. note::
     In Python: :ref:`table.duplicate() <python_api_duplicate>`  CLI reference: :ref:`sqlite-utils duplicate <cli_ref_duplicate>`
 

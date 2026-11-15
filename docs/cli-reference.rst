@@ -1442,8 +1442,14 @@ See :ref:`cli_duplicate_table`.
 
       Create a duplicate of this table, copying across the schema and all row data.
 
+      By default this is a lightweight copy: column names, column types and row data
+      are preserved, but constraints, indexes, triggers and full-text search
+      configuration are not. Use --structure to copy those as well.
+
     Options:
       --ignore               If table does not exist, do nothing
+      --structure            Also copy constraints, indexes, triggers and full-text
+                             search configuration
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.
 
